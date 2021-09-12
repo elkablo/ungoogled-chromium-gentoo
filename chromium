@@ -1,0 +1,431 @@
+# SPDX-License-Identifier: Beerware
+#
+# ungoogled-chromium for Gentoo
+#
+# Copyright (c) 2021 by Marek Behún <kabel@kernel.org>
+#
+#
+# Put this file into /etc/portage/env/www-client/chromium
+#
+# Building with clang:
+#   use CHROMIUM_FORCE_CLANG=yes
+#
+# Building with ThinLTO (currently broken):
+#   use CHROMIUM_FORCE_THINLTO=yes
+#       CHROMIUM_FORCE_CLANG=yes
+#       CHROMIUM_FORCE_LLD=yes
+#
+# Building with PGO (Profile Guided Optimizations):
+#   0. You need to build with clang and link with lld:
+#      CHROMIUM_FORCE_CLANG=yes
+#      CHROMIUM_FORCE_LLD=yes
+#
+#   1. build instrumented binary with
+#      CHROMIUM_FORCE_PGO=yes
+#      CHROMIUM_PGO_PHASE=1
+#
+#   2. create profile by executing and using chromium:
+#      LLVM_PROFILE_FILE=/tmp/chromium.profraw chromium
+#
+#   3. merge profile data with
+#      llvm-profdata merge -output=/tmp/chromium.profdata /tmp/chromium.profraw /tmp/child_pool-*.profraw
+#
+#   4. build PGO optimized binary with
+#      CHROMIUM_FORCE_PGO=yes
+#      CHROMIUM_PGO_PHASE=2
+#      CHROMIUM_PGO_PROFILE=/tmp/chromium.profdata
+#
+
+pre_pkg_pretend() {
+	if use js-type-check || use hangouts; then
+		eerror "USE flags closure-compile and hangouts forbidden when using ungoogled-chromium patches"
+		die
+	fi
+
+	if [[ "${CHROMIUM_FORCE_THINLTO}" == "yes" ]]; then
+		if [[ "${CHROMIUM_FORCE_CLANG}" != yes ]]; then
+			eerror "ThinLTO build supported only with clang!"
+			die
+		fi
+	fi
+
+	if [[ "${CHROMIUM_FORCE_PGO}" == yes ]]; then
+		if [[ "${CHROMIUM_FORCE_CLANG}" != yes ]]; then
+			eerror "PGO build supported only with clang!"
+			die
+		fi
+
+		if [[ "${CHROMIUM_PGO_PHASE}" != 1 && "${CHROMIUM_PGO_PHASE}" != 2 ]]; then
+			eerror "You need to set CHROMIUM_PGO_PHASE to 1 or 2 when"
+			eerror "CHROMIUM_FORCE_PGO is set to yes!"
+			die
+		fi
+
+		if [[ "${CHROMIUM_PGO_PHASE}" == 2 ]]; then
+			if [[ -z "${CHROMIUM_PGO_PROFILE}" || ! -f "${CHROMIUM_PGO_PROFILE}" || ! -r "${CHROMIUM_PGO_PROFILE}" ]]; then
+				eerror "CHROMIUM_PGO_PROFILE needs to be set to chromium's profile file!"
+				die
+			fi
+		fi
+	fi
+}
+
+# Tries to find ungoogled-chromium pull request with title "Update to Chromium ${PN}",
+# checks whether it has at least 2 approving reviews from collaborators or contributors, and
+# downloads that pull request
+download_from_pull_request() {
+	local pr repo url commit reviews tmp
+
+	pr="$(wget -O - https://api.github.com/repos/Eloston/ungoogled-chromium/pulls 2>/dev/null | \
+		sed -ne '
+			/^  },\?$/ {
+				s/.*//
+				x
+				/T Update to Chromium '"${PV/./\.}"'/ {
+					s/\n\?T [^\n]*//
+					s/\n/ /g
+					s/U \([^ ]\+\) S \([^ ]\+\) R \(.*\)/\3 \2 \1/
+					s/S \([^ ]\+\) U \([^ ]\+\) R \(.*\)/\3 \1 \2/
+					s/U \([^ ]\+\) R \([^ ]\+\) S \(.*\)/\2 \3 \1/
+					s/R \([^ ]\+\) U \([^ ]\+\) S \(.*\)/\1 \3 \2/
+					s/R \([^ ]\+\) S \([^ ]\+\) U \(.*\)/\1 \2 \3/
+					s/S \([^ ]\+\) R \([^ ]\+\) U \(.*\)/\2 \1 \3/
+					s/^ *//
+					p
+					q
+				}
+				d
+			}
+			/^    "title": "/ {
+				s/^    "title": "\(.*\)",\?$/T \1/
+				H
+			}
+			/^    "url": "/ {
+				s/^    "url": "\(.*\)",\?$/U \1/
+				H
+			}
+			/^    "head": {$/ {
+				x
+				s/^/H/
+				x
+			}
+			/^    },\?$/ {
+				x
+				s/^H//
+				x
+			}
+			\|^        "html_url": "https://github.com/[^"/]\+/[^"/]\+",\?$| {
+				x
+				/^H/ {
+					x
+					s|^        "html_url": "\([^"]\+\)",\?$|R \1|
+					H
+					x
+				}
+				x
+			}
+			/^      "sha": "/ {
+				x
+				/^H/ {
+					x
+					s/^      "sha": "\([0-9a-fA-F]*\)",\?$/S \1/
+					H
+					x
+				}
+				x
+			}')"
+
+	[[ -z "$pr" ]] && return 1
+
+	repo="${pr%% *}"
+	url="${pr##* }"
+	tmp="${pr% *}"
+	commit="${tmp##* }"
+
+	[[ -z "$repo" || -z "$url" || -z "$commit" ]] && return 1
+
+	einfo "Found PR from $repo commit ${commit:0:12}"
+
+	reviews="$(wget -O - "${url}/reviews" 2>/dev/null | \
+		sed -ne '
+			/^  },\?$/ {
+				x
+				s/^\(AC\|CA\)/x/
+				s/[^x]//g
+				x
+				d
+			}
+			/^    "state": "APPROVED",\?$/ {
+				x
+				s/^/A/
+				x
+			}
+			/^    "author_association": "\(CONTRIBUTOR\|COLLABORATOR\)",\?$/ {
+				x
+				s/^/C/
+				x
+			}
+			$ {
+				x
+				p
+			}
+		')"
+	reviews="${#reviews}"
+
+	if [[ $reviews -lt 2 ]]; then
+		eerror "PR needs 2 approving reviews, has only ${reviews}"
+		return 1
+	fi
+
+	einfo "PR has enough approving reviews (${reviews}), downloading"
+
+	tmp="$(mktemp -d)"
+	[[ -z "$tmp" ]] && die
+
+	pushd "$tmp"
+	git clone "$repo" "ungoogled-chromium-$PV"
+	cd "ungoogled-chromium-$PV"
+	git checkout "$commit"
+	rm -rf .git
+	cd ..
+	tar --owner=0 --group=0 -zcf "${T}/ungoogled-chromium.tar.gz" "ungoogled-chromium-$PV"
+	popd
+	rm -rf "$tmp"
+
+	return 0
+}
+
+# Downloads ungoogled-chromium sources corresponding to chromium's version.
+# If ungoogled-chromium does not yet have tag corresponding to needed version,
+# tries to find valid sources in ungoogled-chromium repository's pull requests.
+post_pkg_setup() {
+	local tag
+
+	if [[ "$MERGE_TYPE" != "source" ]]; then
+		# if emerging binary package, nothing to do
+		return
+	fi
+
+	einfo "Downloading ungoogled-chromium sources for chromium-${PV}"
+
+	tag="`git ls-remote --tags https://github.com/Eloston/ungoogled-chromium | grep -Ee "refs/tags/${PV//./\\.}-[0-9]+\$" | tail -n 1 | grep -Poe '(?<=refs/tags/).*'`"
+	if [[ "${tag:0:${#PV}}" == "$PV" ]]; then
+		wget https://github.com/Eloston/ungoogled-chromium/archive/"$tag".tar.gz -O "$T"/ungoogled-chromium.tar.gz
+	else
+		einfo "Git tag not found for version $PV, trying to find in pull requests..."
+		if ! download_from_pull_request; then
+			eerror "No valid PR found"
+			die
+		fi
+	fi
+}
+
+fix_av_packet_get_side_data_type() {
+	einfo "Patching usage of ffmpeg's av_packet_get_side_data()"
+
+	patch -p1 <<"EOF"
+diff -Naurp a/media/filters/audio_decoder_unittest.cc b/media/filters/audio_decoder_unittest.cc
+--- a/media/filters/audio_decoder_unittest.cc   2021-09-01 03:39:39.000000000 +0200
++++ b/media/filters/audio_decoder_unittest.cc   2021-09-11 23:42:39.459871317 +0200
+@@ -109,7 +109,11 @@ void SetDiscardPadding(AVPacket* packet,
+   }
+ 
+   // If the timestamp is positive, try to use FFmpeg's discard data.
++#if LIBAVUTIL_VERSION_MAJOR < 57
++  int skip_samples_size = 0;
++#else
+   size_t skip_samples_size = 0;
++#endif
+   const uint32_t* skip_samples_ptr =
+       reinterpret_cast<const uint32_t*>(av_packet_get_side_data(
+           packet, AV_PKT_DATA_SKIP_SAMPLES, &skip_samples_size));
+diff -Naurp a/media/filters/ffmpeg_demuxer.cc b/media/filters/ffmpeg_demuxer.cc
+--- a/media/filters/ffmpeg_demuxer.cc   2021-09-11 15:05:22.502647572 +0200
++++ b/media/filters/ffmpeg_demuxer.cc   2021-09-11 23:43:34.933204850 +0200
+@@ -427,11 +427,19 @@ void FFmpegDemuxerStream::EnqueuePacket(
+   scoped_refptr<DecoderBuffer> buffer;
+ 
+   if (type() == DemuxerStream::TEXT) {
++#if LIBAVUTIL_VERSION_MAJOR < 57
++    int id_size = 0;
++#else
+     size_t id_size = 0;
++#endif
+     uint8_t* id_data = av_packet_get_side_data(
+         packet.get(), AV_PKT_DATA_WEBVTT_IDENTIFIER, &id_size);
+ 
++#if LIBAVUTIL_VERSION_MAJOR < 57
++    int settings_size = 0;
++#else
+     size_t settings_size = 0;
++#endif
+     uint8_t* settings_data = av_packet_get_side_data(
+         packet.get(), AV_PKT_DATA_WEBVTT_SETTINGS, &settings_size);
+ 
+@@ -443,7 +451,11 @@ void FFmpegDemuxerStream::EnqueuePacket(
+     buffer = DecoderBuffer::CopyFrom(packet->data, packet->size,
+                                      side_data.data(), side_data.size());
+   } else {
++#if LIBAVUTIL_VERSION_MAJOR < 57
++    int side_data_size = 0;
++#else
+     size_t side_data_size = 0;
++#endif
+     uint8_t* side_data = av_packet_get_side_data(
+         packet.get(), AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL, &side_data_size);
+ 
+@@ -504,7 +516,11 @@ void FFmpegDemuxerStream::EnqueuePacket(
+                                        packet->size - data_offset);
+     }
+ 
++#if LIBAVUTIL_VERSION_MAJOR < 57
++    int skip_samples_size = 0;
++#else
+     size_t skip_samples_size = 0;
++#endif
+     const uint32_t* skip_samples_ptr =
+         reinterpret_cast<const uint32_t*>(av_packet_get_side_data(
+             packet.get(), AV_PKT_DATA_SKIP_SAMPLES, &skip_samples_size));
+EOF
+}
+
+fix_chromedriver_unstripped() {
+	# Gentoo's ebuild expects chromedriver binary chromedriver.unstripped,
+	# and moves it to chromedriver with:
+	#   mv chromedriver.unstripped chromedriver
+	# But ungoogled-chromium patches chromium to force stripping and so
+	# creates binary without the ".unstripped" suffix.
+	# Make it so that we create chromedriver.unstripped binary.
+	# Since the eu-strip binary is pruned away, change the code to just
+	# copy chromedriver.unstripped to chromedriver.
+	# (Gentoo will strip it on its own if stripping is enabled.)
+	patch -p1 <<"EOF"
+diff -Naurp a/build/cp.py b/build/cp.py
+--- a/build/cp.py       2021-09-01 03:39:21.000000000 +0200
++++ b/build/cp.py       2021-09-10 17:03:22.231263159 +0200
+@@ -16,7 +16,8 @@ import sys
+ 
+ def Main(src, dst):
+   # Use copy instead of copyfile to ensure the executable bit is copied.
+-  return shutil.copy(src, os.path.normpath(dst))
++  dst = os.path.normpath(dst)
++  return 0 if shutil.copy(src, dst) == dst else 1
+ 
+ 
+ if __name__ == '__main__':
+diff -Naurp a/chrome/test/chromedriver/BUILD.gn b/chrome/test/chromedriver/BUILD.gn
+--- a/chrome/test/chromedriver/BUILD.gn 2021-09-10 17:06:09.647930429 +0200
++++ b/chrome/test/chromedriver/BUILD.gn 2021-09-10 17:03:51.424596608 +0200
+@@ -308,7 +308,11 @@ source_set("lib") {
+   }
+ }
+ 
++if (is_linux) {
++  chromedriver_output = "chromedriver.unstripped"
++} else {
+   chromedriver_output = "chromedriver"
++}
+ 
+ executable("$chromedriver_output") {
+   testonly = true
+@@ -332,6 +336,17 @@ executable("$chromedriver_output") {
+   }
+ }
+ 
++if (is_linux) {
++  action("chromedriver") {
++    script = "//build/cp.py"
++    sources = [ "$root_out_dir/$chromedriver_output" ]
++    outputs = [ "$root_out_dir/chromedriver" ]
++    args = rebase_path(sources + outputs, root_build_dir)
++    testonly = true
++    deps = [ ":$chromedriver_output" ]
++  }
++}
++
+ python_library("chromedriver_py_tests") {
+   testonly = true
+   deps = [
+EOF
+}
+
+# Applies ungoogled-chromium on the sources
+post_src_prepare() {
+	if [[ "$MERGE_TYPE" != "source" ]]; then
+		# if emerging binary package, nothing to do
+		return
+	fi
+
+	pushd "$WORKDIR"
+	tar -xf "$T"/ungoogled-chromium.tar.gz
+	rm -f "$T"/ungoogled-chromium.tar.gz
+
+	pushd ungoogled-chromium-*
+
+	einfo "Applying ungoogled-chromium scripts"
+	PATH=/usr/bin:"$PATH" ./utils/prune_binaries.py ../chromium-* pruning.list
+	PATH=/usr/bin:"$PATH" ./utils/patches.py apply ../chromium-* patches
+	PATH=/usr/bin:"$PATH" ./utils/domain_substitution.py apply -r domain_regex.list -f domain_substitution.list -c ../domsubcache.tar.gz ../chromium-*
+	popd
+
+	einfo "Fixing sources"
+
+	pushd chromium-${PV}
+
+	# This needs to be fixed if building with PGO, otherwise ninja complains
+	sed -i -e 's/if (pgo_data_path == "" && _pgo_target != "")/if (_pgo_target != "" \&\& pgo_data_path == "")/' build/config/compiler/pgo/BUILD.gn
+
+	fix_chromedriver_unstripped
+
+	popd
+
+	popd
+}
+
+# Add extra ninja configuration flags
+pre_src_configure() {
+	local line tmp
+
+	if [[ "${CHROMIUM_FORCE_THINLTO}" == "yes" ]]; then
+		ewarn "You have enabled building with ThinLTO, which is known"
+		ewarn "to have problems with ungoogled-chromium and will probably fail!"
+
+		EXTRA_GN="${EXTRA_GN} use_thin_lto=true"
+	fi
+
+	if [[ "${CHROMIUM_FORCE_PGO}" == yes ]]; then
+		EXTRA_GN="${EXTRA_GN} chrome_pgo_phase=${CHROMIUM_PGO_PHASE}"
+
+		if [[ "${CHROMIUM_PGO_PHASE}" == 2 ]]; then
+			EXTRA_GN="${EXTRA_GN} pgo_data_path="'"'"${CHROMIUM_PGO_PROFILE}"'"'
+		fi
+
+		einfo "Building with Profile Guided Optimizations, phase ${CHROMIUM_PGO_PHASE}"
+	fi
+
+	# Gentoo's ebuild prohibits linking with lld.
+	# Allow it if user set CHROMIUM_FORCE_LLD=yes.
+	if [[ "${CHROMIUM_FORCE_LLD}" == yes ]]; then
+		EXTRA_GN="${EXTRA_GN} use_lld=true"
+		LD=ld.lld
+
+		einfo "Will link with ld.lld"
+	fi
+
+	einfo "Adding ungoogled-chromium flags to EXTRA_GN"
+
+	tmp="${IFS}"
+	IFS=$'\n'
+	while read line; do
+		case "$line" in
+			enable_nacl=*|enable_widevine=*|fieldtrial_testing_like_official_build=*|chrome_pgo_phase=*)
+				einfo "  Ingoring ${line}"
+				;;
+			*)
+				EXTRA_GN="${EXTRA_GN} ${line}"
+				einfo "  Adding ${line}"
+				;;
+		esac
+	done <"$WORKDIR"/ungoogled-chromium-*/flags.gn
+	IFS="${tmp}"
+}
